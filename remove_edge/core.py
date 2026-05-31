@@ -10,6 +10,9 @@ import numpy as np
 import tifffile
 from PIL import Image
 
+# Microscopy scans exceed Pillow's default decompression-bomb limit (~89 MP).
+Image.MAX_IMAGE_PIXELS = None
+
 
 @dataclass(frozen=True)
 class CropResult:
@@ -221,11 +224,17 @@ def _save_png(path: Path, image: np.ndarray) -> None:
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D grayscale image, got shape {arr.shape}")
 
+    height, width = arr.shape
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(path, format="PNG", compress_level=6, optimize=True)
 
     with Image.open(path) as saved:
-        saved.verify()
+        saved.load()
+        if saved.size != (width, height):
+            raise OSError(
+                f"PNG size mismatch for {path.name}: "
+                f"saved {saved.size[0]}x{saved.size[1]}, expected {width}x{height}"
+            )
 
 
 def _save_image(path: Path, image: np.ndarray) -> None:
