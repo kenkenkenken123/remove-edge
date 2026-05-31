@@ -33,9 +33,15 @@ class CropResult:
 
     @property
     def cropped_shape(self) -> tuple[int, int]:
+        """Height and width of the detected tissue region (not the output file)."""
         if self.tight_y0 is not None and self.tight_y1 is not None:
             return self.tight_y1 - self.tight_y0, self.tight_x1 - self.tight_x0
         return self.y1 - self.y0, self.x1 - self.x0
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        """Output file dimensions — always matches the original input."""
+        return self.original_shape
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,34 @@ def _save_png(path: Path, image: np.ndarray) -> None:
             )
 
 
+def _save_jpeg(path: Path, image: np.ndarray, *, quality: int = 85) -> None:
+    """Save an 8-bit grayscale or BGR image as JPEG at full resolution."""
+    if image.dtype != np.uint8:
+        raise ValueError(f"Expected uint8 image for output, got {image.dtype}")
+
+    if image.ndim == 2:
+        arr = np.ascontiguousarray(image)
+        pil_img = Image.fromarray(arr, mode="L")
+        height, width = arr.shape
+    elif image.ndim == 3 and image.shape[2] == 3:
+        rgb = cv2.cvtColor(np.ascontiguousarray(image), cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb, mode="RGB")
+        height, width = image.shape[:2]
+    else:
+        raise ValueError(f"Expected 2D grayscale or BGR image, got shape {image.shape}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pil_img.save(path, format="JPEG", quality=quality, optimize=True)
+
+    with Image.open(path) as saved:
+        saved.load()
+        if saved.size != (width, height):
+            raise OSError(
+                f"JPEG size mismatch for {path.name}: "
+                f"saved {saved.size[0]}x{saved.size[1]}, expected {width}x{height}"
+            )
+
+
 def _save_image(path: Path, image: np.ndarray) -> None:
     """Save an 8-bit grayscale image as PNG or TIFF."""
     if image.dtype != np.uint8:
@@ -251,10 +285,7 @@ def _save_image(path: Path, image: np.ndarray) -> None:
         _save_png(path, image)
         return
     if suffix in {".jpg", ".jpeg"}:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(path), np.ascontiguousarray(image))
-        if not ok:
-            raise OSError(f"Failed to write image: {path}")
+        _save_jpeg(path, image)
         return
 
     raise ValueError(f"Unsupported output format: {path.suffix}")
@@ -294,11 +325,14 @@ def remove_edge(
     tight_crop: bool = True,
 ) -> tuple[ProcessResult, np.ndarray]:
     """
-    Crop dark borders from a TIFF and remove faint edge glow.
+    Remove dark borders and faint edge glow from a TIFF.
+
+    Output files keep the original pixel dimensions. Processed tissue is written
+    at its original coordinates; all other pixels are black.
 
     Saves four outputs plus returns the final image array:
     - masked TIFF / PNG: binary tissue mask (255 = tissue)
-    - masked final TIFF / PNG: cropped tissue on black background
+    - masked final TIFF / PNG: cleaned tissue on black background
     """
     input_path = Path(input_path)
     defaults = _default_output_paths(input_path, output_dir)
@@ -320,23 +354,30 @@ def remove_edge(
         margin=margin,
     )
 
-    cropped = image[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1].copy()
+    region = image[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1].copy()
 
     applied_halo: float | None = None
     tight_y0 = tight_y1 = tight_x0 = tight_x1 = None
+    embed_y0, embed_x0 = bounds.y0, bounds.x0
 
     if clean_border:
-        cropped, applied_halo = _clean_faint_border(
-            cropped, bounds.threshold, halo_threshold
+        region, applied_halo = _clean_faint_border(
+            region, bounds.threshold, halo_threshold
         )
 
     if tight_crop:
-        ty0, ty1, tx0, tx1 = _tight_bbox(cropped)
-        cropped = cropped[ty0:ty1, tx0:tx1]
-        tight_y0 = bounds.y0 + ty0
-        tight_y1 = bounds.y0 + ty1
-        tight_x0 = bounds.x0 + tx0
-        tight_x1 = bounds.x0 + tx1
+        ty0, ty1, tx0, tx1 = _tight_bbox(region)
+        region = region[ty0:ty1, tx0:tx1]
+        embed_y0 = bounds.y0 + ty0
+        embed_x0 = bounds.x0 + tx0
+        tight_y0 = embed_y0
+        tight_y1 = embed_y0 + region.shape[0]
+        tight_x0 = embed_x0
+        tight_x1 = embed_x0 + region.shape[1]
+
+    final = np.zeros_like(image)
+    rh, rw = region.shape
+    final[embed_y0 : embed_y0 + rh, embed_x0 : embed_x0 + rw] = region
 
     crop_result = CropResult(
         bounds.y0,
@@ -353,13 +394,13 @@ def remove_edge(
         tight_x1,
     )
 
-    mask = _build_mask(cropped)
+    mask = _build_mask(final)
     _save_image(paths.mask_tif, mask)
     _save_image(paths.mask_png, mask)
-    _save_image(paths.final_tif, cropped)
-    _save_image(paths.final_png, cropped)
+    _save_image(paths.final_tif, final)
+    _save_image(paths.final_png, final)
 
-    return ProcessResult(crop_result, paths), cropped
+    return ProcessResult(crop_result, paths), final
 
 
 def save_preview(
@@ -367,7 +408,7 @@ def save_preview(
     preview_path: str | Path,
     bounds: CropResult,
     *,
-    max_size: int = 1200,
+    max_size: int | None = None,
 ) -> None:
     """Save a JPEG preview with the detected crop rectangle drawn."""
     input_path = Path(input_path)
@@ -376,16 +417,8 @@ def save_preview(
 
     image = load_image(input_path)
     height, width = image.shape
-    scale = max(height, width) / max_size
-    if scale < 1:
-        scale = 1
+    preview = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-    preview_h = int(height / scale)
-    preview_w = int(width / scale)
-    small = cv2.resize(image, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-    preview = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
-
-    inv = 1 / scale
     x0 = bounds.tight_x0 if bounds.tight_x0 is not None else bounds.x0
     y0 = bounds.tight_y0 if bounds.tight_y0 is not None else bounds.y0
     x1 = bounds.tight_x1 if bounds.tight_x1 is not None else bounds.x1
@@ -394,18 +427,33 @@ def save_preview(
     # Bounds are slice-exclusive; convert to inclusive pixel coords for drawing.
     last_x = min(x1 - 1, width - 1)
     last_y = min(y1 - 1, height - 1)
-    pt1 = (max(0, int(x0 * inv)), max(0, int(y0 * inv)))
-    pt2 = (
-        min(preview_w - 1, int(last_x * inv)),
-        min(preview_h - 1, int(last_y * inv)),
-    )
-    thickness = max(3, int(3 / scale))
-    x0p, y0p = pt1
-    x1p, y1p = pt2
+
+    if max_size is not None and max_size > 0:
+        scale = max(height, width) / max_size
+        if scale > 1:
+            preview_w = int(width / scale)
+            preview_h = int(height / scale)
+            preview = cv2.resize(preview, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+            sx = preview_w / width
+            sy = preview_h / height
+            x0p = max(0, int(x0 * sx))
+            y0p = max(0, int(y0 * sy))
+            x1p = min(preview_w - 1, int(last_x * sx))
+            y1p = min(preview_h - 1, int(last_y * sy))
+            thickness = max(3, int(3 * max(sx, sy)))
+        else:
+            x0p, y0p = max(0, x0), max(0, y0)
+            x1p, y1p = last_x, last_y
+            thickness = max(3, int(max(width, height) / 4000))
+    else:
+        x0p, y0p = max(0, x0), max(0, y0)
+        x1p, y1p = last_x, last_y
+        thickness = max(3, int(max(width, height) / 4000))
+
     green = (0, 255, 0)
     cv2.line(preview, (x0p, y0p), (x1p, y0p), green, thickness)  # top
     cv2.line(preview, (x0p, y1p), (x1p, y1p), green, thickness)  # bottom
     cv2.line(preview, (x0p, y0p), (x0p, y1p), green, thickness)  # left
     cv2.line(preview, (x1p, y0p), (x1p, y1p), green, thickness)  # right
 
-    cv2.imwrite(str(preview_path), preview)
+    _save_jpeg(preview_path, preview)

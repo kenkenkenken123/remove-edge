@@ -110,6 +110,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only generate previews, do not write output files",
     )
+    parser.add_argument(
+        "--preview-max-size",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="Max preview width/height in pixels (default: full input resolution)",
+    )
     return parser
 
 
@@ -137,10 +144,11 @@ def process_file(args: argparse.Namespace, input_path: Path) -> bool:
                 downsample=args.downsample,
                 margin=args.margin,
             )
-            save_preview(input_path, preview, bounds)
+            save_preview(input_path, preview, bounds, max_size=args.preview_max_size)
             print(f"[{input_path.name}] Preview saved: {preview}")
             print(f"  crop y=[{bounds.y0},{bounds.y1}] x=[{bounds.x0},{bounds.x1}]")
-            print(f"  size {bounds.original_shape} -> {bounds.cropped_shape}")
+            print(f"  tissue region {bounds.cropped_shape[1]}x{bounds.cropped_shape[0]}")
+            print(f"  output {bounds.output_shape[1]}x{bounds.output_shape[0]} (same as input)")
             print(f"  threshold {bounds.threshold:.1f}")
             return True
 
@@ -160,7 +168,7 @@ def process_file(args: argparse.Namespace, input_path: Path) -> bool:
         )
         bounds = result.bounds
         paths = result.paths
-        save_preview(input_path, preview, bounds)
+        save_preview(input_path, preview, bounds, max_size=args.preview_max_size)
 
         print(f"[{input_path.name}]")
         print(f"  Masked TIFF:       {paths.mask_tif}")
@@ -168,7 +176,9 @@ def process_file(args: argparse.Namespace, input_path: Path) -> bool:
         print(f"  Masked final TIFF: {paths.final_tif}")
         print(f"  Masked final PNG:  {paths.final_png}")
         print(f"  Preview:           {preview}")
-        print(f"  {bounds.original_shape[1]}x{bounds.original_shape[0]} -> {bounds.cropped_shape[1]}x{bounds.cropped_shape[0]}")
+        out_h, out_w = bounds.output_shape
+        tissue_h, tissue_w = bounds.cropped_shape
+        print(f"  output {out_w}x{out_h} (same as input), tissue region {tissue_w}x{tissue_h}")
         print(f"  threshold {bounds.threshold:.1f}", end="")
         if bounds.halo_threshold is not None:
             print(f", halo {bounds.halo_threshold:.1f}", end="")
