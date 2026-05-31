@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import tifffile
+from PIL import Image
 
 
 @dataclass(frozen=True)
@@ -214,18 +215,37 @@ def _clean_faint_border(
     return cleaned, cutoff
 
 
+def _save_png(path: Path, image: np.ndarray) -> None:
+    """Save an 8-bit grayscale PNG at full resolution."""
+    arr = np.ascontiguousarray(image, dtype=np.uint8)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D grayscale image, got shape {arr.shape}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(path, format="PNG", compress_level=6, optimize=True)
+
+    with Image.open(path) as saved:
+        saved.verify()
+
+
 def _save_image(path: Path, image: np.ndarray) -> None:
     """Save an 8-bit grayscale image as PNG or TIFF."""
     if image.dtype != np.uint8:
         raise ValueError(f"Expected uint8 image for output, got {image.dtype}")
 
     suffix = path.suffix.lower()
-    path.parent.mkdir(parents=True, exist_ok=True)
     if suffix in {".tif", ".tiff"}:
-        tifffile.imwrite(path, image, compression=None)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(path, np.ascontiguousarray(image), compression=None)
         return
-    if suffix in {".png", ".jpg", ".jpeg"}:
-        cv2.imwrite(str(path), image)
+    if suffix == ".png":
+        _save_png(path, image)
+        return
+    if suffix in {".jpg", ".jpeg"}:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(path), np.ascontiguousarray(image))
+        if not ok:
+            raise OSError(f"Failed to write image: {path}")
         return
 
     raise ValueError(f"Unsupported output format: {path.suffix}")

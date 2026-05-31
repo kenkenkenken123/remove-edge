@@ -107,7 +107,7 @@ Five files are written on every run:
 | `<name>_masked.tif` | 8-bit TIFF | Binary tissue mask (255 = tissue, 0 = background) |
 | `<name>_masked.png` | 8-bit PNG | Same binary mask, easy to view |
 | `<name>_masked_final.tif` | 8-bit TIFF | Final cropped tissue on black background |
-| `<name>_masked_final.png` | 8-bit PNG | Same as final TIFF, easy to view |
+| `<name>_masked_final.png` | 8-bit PNG | Same cropped tissue as final TIFF, full resolution |
 | `<name>_preview.jpg` | JPEG | Full scan with green crop box |
 
 ---
@@ -140,7 +140,7 @@ python -m remove_edge "your_file.tif" --threshold 30 --halo-threshold 70
 | `output/<name>_masked.tif` | **Binary mask** — white = tissue, black = background (TIFF) |
 | `output/<name>_masked.png` | **Binary mask** — same as above (PNG) |
 | `output/<name>_masked_final.tif` | **Final TIFF** — cropped tissue on black (for analysis) |
-| `output/<name>_masked_final.png` | **Final PNG** — same as TIFF, easy to view |
+| `output/<name>_masked_final.png` | **Final PNG** — same resolution as final TIFF |
 | `output/<name>_preview.jpg` | **Preview** — full scan with green crop box |
 
 The preview shows where the tool will crop. The PNG is the cleaned, cropped result.
