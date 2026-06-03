@@ -6,7 +6,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from remove_edge.core import detect_content_bounds, load_image, remove_edge, save_preview
+from remove_edge.core import (
+    detect_content_bounds,
+    load_image,
+    remove_edge,
+    save_combined_jpg,
+    save_preview,
+)
 
 
 def collect_tif_paths(path: Path) -> list[Path]:
@@ -169,6 +175,11 @@ def process_file(args: argparse.Namespace, input_path: Path) -> bool:
         bounds = result.bounds
         paths = result.paths
         save_preview(input_path, preview, bounds, max_size=args.preview_max_size)
+        combined = save_combined_jpg(
+            input_path,
+            args.output_dir,
+            search_dirs=(input_path.parent, args.output_dir, Path("input")),
+        )
 
         print(f"[{input_path.name}]")
         print(f"  Masked TIFF:       {paths.mask_tif}")
@@ -176,6 +187,8 @@ def process_file(args: argparse.Namespace, input_path: Path) -> bool:
         print(f"  Masked final TIFF: {paths.final_tif}")
         print(f"  Masked final PNG:  {paths.final_png}")
         print(f"  Preview:           {preview}")
+        print(f"  Massed uframe:     {combined.massed_tif}")
+        print(f"  Combined preview:  {combined.preview_jpg}")
         out_h, out_w = bounds.output_shape
         tissue_h, tissue_w = bounds.cropped_shape
         print(f"  output {out_w}x{out_h} (same as input), tissue region {tissue_w}x{tissue_h}")

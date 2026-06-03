@@ -13,6 +13,9 @@ from PIL import Image
 # Microscopy scans exceed Pillow's default decompression-bomb limit (~89 MP).
 Image.MAX_IMAGE_PIXELS = None
 
+# Background color for mask and final outputs (R, G, B).
+BACKGROUND_RGB = np.array([249, 245, 242], dtype=np.uint8)
+
 
 @dataclass(frozen=True)
 class CropResult:
@@ -87,7 +90,7 @@ def convert_to_uint8(image: np.ndarray) -> np.ndarray:
         hi = float(data.max())
     if hi <= lo:
         hi = lo + 1.0
-
+    
     return np.clip((data - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
 
 
@@ -225,14 +228,19 @@ def _clean_faint_border(
 
 
 def _save_png(path: Path, image: np.ndarray) -> None:
-    """Save an 8-bit grayscale PNG at full resolution."""
+    """Save an 8-bit grayscale or RGB PNG at full resolution."""
     arr = np.ascontiguousarray(image, dtype=np.uint8)
-    if arr.ndim != 2:
-        raise ValueError(f"Expected 2D grayscale image, got shape {arr.shape}")
+    if arr.ndim == 2:
+        pil_img = Image.fromarray(arr, mode="L")
+        height, width = arr.shape
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        pil_img = Image.fromarray(arr, mode="RGB")
+        height, width = arr.shape[:2]
+    else:
+        raise ValueError(f"Expected 2D grayscale or RGB image, got shape {arr.shape}")
 
-    height, width = arr.shape
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr).save(path, format="PNG", compress_level=6, optimize=True)
+    pil_img.save(path, format="PNG", compress_level=6, optimize=True)
 
     with Image.open(path) as saved:
         saved.load()
@@ -272,7 +280,7 @@ def _save_jpeg(path: Path, image: np.ndarray, *, quality: int = 85) -> None:
 
 
 def _save_image(path: Path, image: np.ndarray) -> None:
-    """Save an 8-bit grayscale image as PNG or TIFF."""
+    """Save an 8-bit grayscale or RGB image as PNG or TIFF."""
     if image.dtype != np.uint8:
         raise ValueError(f"Expected uint8 image for output, got {image.dtype}")
 
@@ -304,9 +312,33 @@ def _default_output_paths(input_path: Path, output_dir: Path | None = None) -> O
     )
 
 
-def _build_mask(final_image: np.ndarray) -> np.ndarray:
-    """Binary tissue mask aligned with the final output (255 = tissue, 0 = background)."""
-    return ((final_image > 0).astype(np.uint8) * 255)
+def _full_resolution_mask(
+    image: np.ndarray,
+    threshold: float,
+    downsample: int = 8,
+) -> np.ndarray:
+    """Binary tissue mask at full resolution (255 = tissue, 0 = background)."""
+    height, width = image.shape
+    downsample = max(1, downsample)
+    small_h = max(1, height // downsample)
+    small_w = max(1, width // downsample)
+    small = cv2.resize(
+        _to_float32(image),
+        (small_w, small_h),
+        interpolation=cv2.INTER_AREA,
+    )
+    small_mask = _content_mask(small, threshold)
+    full_mask = cv2.resize(small_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    return (full_mask * 255).astype(np.uint8)
+
+
+def _masked_final(tissue_mask: np.ndarray) -> np.ndarray:
+    """Slide background only (BACKGROUND_RGB); tissue regions left empty (black)."""
+    h, w = tissue_mask.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    slide_background = tissue_mask == 0
+    out[slide_background] = BACKGROUND_RGB
+    return out
 
 
 def remove_edge(
@@ -328,11 +360,11 @@ def remove_edge(
     Remove dark borders and faint edge glow from a TIFF.
 
     Output files keep the original pixel dimensions. Processed tissue is written
-    at its original coordinates; all other pixels are black.
+    at its original coordinates; all other pixels use BACKGROUND_RGB (249, 245, 242).
 
     Saves four outputs plus returns the final image array:
-    - masked TIFF / PNG: binary tissue mask (255 = tissue)
-    - masked final TIFF / PNG: cleaned tissue on black background
+    - masked TIFF / PNG: binary mask (255 = background, 0 = tissue)
+    - masked final TIFF / PNG: slide background as BACKGROUND_RGB, tissue empty (black)
     """
     input_path = Path(input_path)
     defaults = _default_output_paths(input_path, output_dir)
@@ -343,7 +375,12 @@ def remove_edge(
         final_png=final_png_path or defaults.final_png,
         preview_jpg=defaults.preview_jpg,
     )
-    for path in (paths.mask_tif, paths.mask_png, paths.final_tif, paths.final_png):
+    for path in (
+        paths.mask_tif,
+        paths.mask_png,
+        paths.final_tif,
+        paths.final_png,
+    ):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     image = load_image(input_path)
@@ -354,11 +391,12 @@ def remove_edge(
         margin=margin,
     )
 
+    tissue_mask = _full_resolution_mask(image, bounds.threshold, downsample)
+
     region = image[bounds.y0 : bounds.y1, bounds.x0 : bounds.x1].copy()
 
     applied_halo: float | None = None
     tight_y0 = tight_y1 = tight_x0 = tight_x1 = None
-    embed_y0, embed_x0 = bounds.y0, bounds.x0
 
     if clean_border:
         region, applied_halo = _clean_faint_border(
@@ -367,17 +405,10 @@ def remove_edge(
 
     if tight_crop:
         ty0, ty1, tx0, tx1 = _tight_bbox(region)
-        region = region[ty0:ty1, tx0:tx1]
-        embed_y0 = bounds.y0 + ty0
-        embed_x0 = bounds.x0 + tx0
-        tight_y0 = embed_y0
-        tight_y1 = embed_y0 + region.shape[0]
-        tight_x0 = embed_x0
-        tight_x1 = embed_x0 + region.shape[1]
-
-    final = np.zeros_like(image)
-    rh, rw = region.shape
-    final[embed_y0 : embed_y0 + rh, embed_x0 : embed_x0 + rw] = region
+        tight_y0 = bounds.y0 + ty0
+        tight_y1 = bounds.y0 + ty1
+        tight_x0 = bounds.x0 + tx0
+        tight_x1 = bounds.x0 + tx1
 
     crop_result = CropResult(
         bounds.y0,
@@ -394,13 +425,128 @@ def remove_edge(
         tight_x1,
     )
 
-    mask = _build_mask(final)
-    _save_image(paths.mask_tif, mask)
-    _save_image(paths.mask_png, mask)
-    _save_image(paths.final_tif, final)
-    _save_image(paths.final_png, final)
+    final_out = _masked_final(tissue_mask)
+    display_mask = (255 - tissue_mask).astype(np.uint8)
+    _save_image(paths.mask_tif, display_mask)
+    _save_image(paths.mask_png, display_mask)
+    _save_image(paths.final_tif, final_out)
+    _save_image(paths.final_png, final_out)
 
-    return ProcessResult(crop_result, paths), final
+    return ProcessResult(crop_result, paths), final_out
+
+
+def _resize_panel(image: np.ndarray, max_side: int) -> np.ndarray:
+    """Downscale an RGB panel so its longest side is at most max_side."""
+    height, width = image.shape[:2]
+    scale = max(height, width) / max_side
+    if scale <= 1:
+        return image
+    new_w = int(width / scale)
+    new_h = int(height / scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def find_uframe_jpg(slide_stem: str, *search_dirs: Path) -> Path | None:
+    """
+    Find a uframe JPG whose filename ends with the slide stem.
+
+    Example slide stem ``PE21HKSH_Target lesion 1G`` matches
+    ``uframe_<random>_PE21HKSH_Target lesion 1G.jpg``.
+    """
+    checked: set[Path] = set()
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        patterns = ("uframe_*.jpg", "uframe_*.jpeg", "uframe_*.JPG", "uframe_*.JPEG")
+        for pattern in patterns:
+            for path in sorted(directory.glob(pattern)):
+                if path in checked:
+                    continue
+                checked.add(path)
+                name = path.stem
+                if name == slide_stem or name.endswith(f"_{slide_stem}"):
+                    return path
+    return None
+
+
+def _massed_uframe_tif_name(uframe_jpg: Path) -> str:
+    """``uframe_<rest>.jpg`` → ``Massed_uframe_<rest>.tif``."""
+    stem = uframe_jpg.stem
+    if stem.startswith("uframe_"):
+        return f"Massed_uframe_{stem[7:]}.tif"
+    return f"Massed_{stem}.tif"
+
+
+def _build_massed_uframe(uframe_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Match Massed_uframe compositing: uframe on tissue, cream slide background elsewhere.
+
+    ``mask``: white (255) = background, black (0) = tissue.
+    """
+    if uframe_bgr.shape[:2] != mask.shape:
+        raise ValueError(
+            f"Uframe {uframe_bgr.shape[:2]} and mask {mask.shape} size mismatch"
+        )
+    out = uframe_bgr.copy()
+    cream_bgr = BACKGROUND_RGB[::-1]
+    out[mask > 0] = cream_bgr
+    return out
+
+
+@dataclass(frozen=True)
+class CombinedOutputs:
+    """Full-resolution Massed_uframe TIFF and a downscaled preview JPG."""
+
+    massed_tif: Path
+    preview_jpg: Path
+
+
+def save_combined_jpg(
+    input_path: str | Path,
+    output_dir: str | Path,
+    *,
+    search_dirs: tuple[Path, ...] | None = None,
+    max_panel_size: int = 4096,
+) -> CombinedOutputs:
+    """
+    Save Massed_uframe output: uframe on tissue, BACKGROUND_RGB on slide background.
+
+    Writes ``Massed_uframe_<uframe-suffix>.tif`` (full resolution) and
+    ``<slide_stem>_combined.jpg`` (preview).
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    stem = input_path.stem
+    dirs = search_dirs or (input_path.parent, output_dir, Path("input"))
+    preview_path = output_dir / f"{stem}_combined.jpg"
+
+    mask_png = output_dir / f"{stem}_masked.png"
+    if not mask_png.exists():
+        raise FileNotFoundError(f"Masked PNG not found: {mask_png}")
+
+    uframe_jpg = find_uframe_jpg(stem, *dirs)
+    if uframe_jpg is None:
+        raise FileNotFoundError(
+            f"No uframe JPG found for {stem!r} (expected uframe_*_{stem}.jpg in input/)"
+        )
+
+    mask = cv2.imread(str(mask_png), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise FileNotFoundError(f"Could not read mask: {mask_png}")
+    uframe_bgr = cv2.imread(str(uframe_jpg), cv2.IMREAD_COLOR)
+    if uframe_bgr is None:
+        raise FileNotFoundError(f"Could not read uframe: {uframe_jpg}")
+
+    combined_bgr = _build_massed_uframe(uframe_bgr, mask)
+    massed_path = output_dir / _massed_uframe_tif_name(uframe_jpg)
+    massed_path.parent.mkdir(parents=True, exist_ok=True)
+    combined_rgb = cv2.cvtColor(combined_bgr, cv2.COLOR_BGR2RGB)
+    _save_image(massed_path, combined_rgb)
+
+    preview_bgr = _resize_panel(combined_bgr, max_panel_size)
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_jpeg(preview_path, preview_bgr)
+    return CombinedOutputs(massed_tif=massed_path, preview_jpg=preview_path)
 
 
 def save_preview(
